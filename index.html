@@ -1,0 +1,134 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>KDFW Pro Forecaster (Full Suite)</title>
+    <!-- Tailwind CSS -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- React & Libraries -->
+    <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+    <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+    <script crossorigin src="https://unpkg.com/recharts/umd/Recharts.js"></script>
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    <style>
+        body { background-color: #f8fafc; }
+        #root { min-height: 100vh; }
+    </style>
+</head>
+<body>
+    <div id="system-check" class="bg-red-600 text-white p-4 hidden text-center font-bold">
+        FIREWALL DETECTED: A required library failed to load. Check your network permissions.
+    </div>
+    <div id="root"></div>
+
+    <script type="text/babel">
+        // Pre-flight check for libraries
+        window.onload = () => {
+            if (typeof React === 'undefined' || typeof Recharts === 'undefined') {
+                document.getElementById('system-check').classList.remove('hidden');
+            }
+        };
+
+        const { useState, useEffect } = React;
+        const { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, ReferenceLine, Brush } = Recharts;
+
+        const App = () => {
+            const [data, setData] = useState([]);
+            const [loading, setLoading] = useState(true);
+            const [error, setError] = useState(null);
+            const [metrics, setMetrics] = useState({ currentObs: null, currentFcst: null, bias: null, mae: null });
+            const [extremes, setExtremes] = useState({ todayHigh: null, tonightLow: null, tomorrowHigh: null, tomorrowLow: null });
+
+            const fetchData = async () => {
+                setLoading(true);
+                try {
+                    const [obs, fcst] = await Promise.all([
+                        fetch('https://api.weather.gov/stations/KDFW/observations').then(r => r.json()),
+                        fetch('https://api.weather.gov/gridpoints/FWD/86,104/forecast/hourly').then(r => r.json())
+                    ]);
+                    processData(obs.features, fcst.properties.periods);
+                } catch (e) {
+                    setError("Failed to fetch data: " + e.message);
+                } finally {
+                    setLoading(false);
+                }
+            };
+
+            const processData = (obs, fcst) => {
+                const timeline = {};
+                obs.forEach(o => {
+                    const d = new Date(o.properties.timestamp);
+                    const key = d.toISOString().slice(0, 13);
+                    timeline[key] = { time: d, obs: Math.round((o.properties.temperature.value * 9/5) + 32) };
+                });
+                fcst.forEach(f => {
+                    const d = new Date(f.startTime);
+                    const key = d.toISOString().slice(0, 13);
+                    if (!timeline[key]) timeline[key] = { time: d };
+                    timeline[key].fcst = f.temperature;
+                    timeline[key].dew = Math.round((f.dewpoint.value * 9/5) + 32);
+                });
+
+                const sorted = Object.values(timeline).sort((a,b) => a.time - b.time);
+                
+                // Bias Logic
+                let bSum = 0, wSum = 0;
+                sorted.forEach((d, i) => {
+                    if (d.obs !== undefined && d.fcst !== undefined) {
+                        const weight = Math.exp((i - sorted.length)/10);
+                        bSum += (d.fcst - d.obs) * weight;
+                        wSum += weight;
+                    }
+                });
+
+                const bias = bSum / wSum;
+                setMetrics({ bias, currentObs: sorted[sorted.length-1].obs, currentFcst: sorted[sorted.length-1].fcst });
+                setData(sorted);
+            };
+
+            useEffect(() => { fetchData(); }, []);
+
+            if (loading) return <div className="p-8 text-center text-slate-500">Initializing Professional Suite...</div>;
+
+            return (
+                <div className="max-w-7xl mx-auto p-6 space-y-6">
+                    <header className="bg-white p-6 rounded-2xl shadow-sm border border-slate-200">
+                        <h1 className="text-2xl font-bold">KDFW Professional Forecaster</h1>
+                        <p className="text-sm text-slate-500">Full Suite Operational</p>
+                    </header>
+
+                    {/* Metrics Grid */}
+                    <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
+                        <div className="bg-white p-4 rounded-xl border shadow-sm">
+                            <p className="text-xs text-slate-500 uppercase">Current Obs</p>
+                            <p className="text-2xl font-bold">{metrics.currentObs}°F</p>
+                        </div>
+                        <div className="bg-white p-4 rounded-xl border shadow-sm">
+                            <p className="text-xs text-slate-500 uppercase">Weighted Bias</p>
+                            <p className="text-2xl font-bold text-blue-600">{metrics.bias.toFixed(1)}°</p>
+                        </div>
+                    </div>
+
+                    {/* Chart */}
+                    <div className="bg-white p-6 rounded-2xl shadow-sm border border-slate-200 h-96">
+                        <ResponsiveContainer width="100%" height="100%">
+                            <LineChart data={data}>
+                                <CartesianGrid strokeDasharray="3 3" />
+                                <XAxis dataKey="time" tickFormatter={(t) => t.getHours()} />
+                                <YAxis domain={['auto', 'auto']} />
+                                <Tooltip />
+                                <Line type="monotone" dataKey="obs" stroke="#f59e0b" name="Obs" />
+                                <Line type="monotone" dataKey="fcst" stroke="#3b82f6" name="Fcst" strokeDasharray="5 5" />
+                            </LineChart>
+                        </ResponsiveContainer>
+                    </div>
+                </div>
+            );
+        };
+
+        const root = ReactDOM.createRoot(document.getElementById('root'));
+        root.render(<App />);
+    </script>
+</body>
+</html>
