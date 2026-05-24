@@ -1,0 +1,623 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>KDFW VIV Dashboard</title>
+    
+    <!-- Load Tailwind CSS -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    
+    <!-- Load React, ReactDOM, and Babel -->
+    <script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+    <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    
+    <!-- Load Recharts and its dependencies -->
+    <script src="https://unpkg.com/prop-types@15.7.2/prop-types.min.js"></script>
+    <script src="https://unpkg.com/recharts@2.12.0/umd/Recharts.js"></script>
+</head>
+<body>
+    <div id="root"></div>
+
+    <script type="text/babel">
+        const { useState, useEffect } = React;
+        const { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer, ReferenceLine, Brush } = window.Recharts;
+
+        // We use inline SVGs here so the HTML file remains completely standalone
+        const Activity = ({ size = 24, className = "" }) => (
+            <svg xmlns="http://www.w3.org/2000/svg" width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className={className}><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"></polyline></svg>
+        );
+        const RefreshCw = ({ size = 24, className = "" }) => (
+            <svg xmlns="http://www.w3.org/2000/svg" width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className={className}><polyline points="23 4 23 10 17 10"></polyline><polyline points="1 20 1 14 7 14"></polyline><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"></path></svg>
+        );
+        const AlertCircle = ({ size = 24, className = "" }) => (
+            <svg xmlns="http://www.w3.org/2000/svg" width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className={className}><circle cx="12" cy="12" r="10"></circle><line x1="12" y1="8" x2="12" y2="12"></line><line x1="12" y1="16" x2="12.01" y2="16"></line></svg>
+        );
+        const Clock = ({ size = 24, className = "" }) => (
+            <svg xmlns="http://www.w3.org/2000/svg" width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className={className}><circle cx="12" cy="12" r="10"></circle><polyline points="12 6 12 12 16 14"></polyline></svg>
+        );
+        const Moon = ({ size = 24, className = "" }) => (
+            <svg xmlns="http://www.w3.org/2000/svg" width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className={className}><path d="M12 3a6 6 0 0 0 9 9 9 9 0 1 1-9-9Z"></path></svg>
+        );
+
+        const App = () => {
+            const [data, setData] = useState([]);
+            const [loading, setLoading] = useState(true);
+            const [refreshing, setRefreshing] = useState(false);
+            const [error, setError] = useState(null);
+            const [lastUpdated, setLastUpdated] = useState(null);
+            const [metrics, setMetrics] = useState({ 
+                currentObs: null, currentFcst: null, currentError: null,
+                overallBias: null, nightBias: null, mae: null 
+            });
+            const [lowTemps, setLowTemps] = useState({ tonight: null, tomorrowNight: null });
+            const [brushRange, setBrushRange] = useState(null);
+
+            // FAIL SAFE: Robust fetch with timeout and retries for flaky NWS API
+            const fetchWithRetry = async (url, retries = 3, timeout = 10000) => {
+                for (let i = 0; i < retries; i++) {
+                try {
+                    const controller = new AbortController();
+                    const id = setTimeout(() => controller.abort(), timeout);
+                    const response = await fetch(url, { signal: controller.signal });
+                    clearTimeout(id);
+                    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+                    return await response.json();
+                } catch (err) {
+                    if (i === retries - 1) throw err;
+                    // Exponential backoff before retrying
+                    await new Promise(res => setTimeout(res, 1000 * (i + 1))); 
+                }
+                }
+            };
+
+            const fetchData = async () => {
+                setRefreshing(true);
+                // Only trigger full layout loading if we don't have data yet
+                if (data.length === 0) setLoading(true); 
+                setError(null);
+                try {
+                // Fetch KDFW Observations
+                const obsData = await fetchWithRetry('https://api.weather.gov/stations/KDFW/observations');
+                
+                // Fetch KDFW Grid Forecast (Hourly)
+                const fcstData = await fetchWithRetry('https://api.weather.gov/gridpoints/FWD/86,104/forecast/hourly');
+
+                // Fail-safe: Ensure API returned the expected nested properties before processing
+                if (!obsData?.features || !fcstData?.properties?.periods) {
+                    throw new Error('NWS API returned malformed or incomplete data.');
+                }
+
+                processVIVData(obsData.features, fcstData.properties.periods);
+                setLastUpdated(new Date());
+                } catch (err) {
+                setError(`NWS API Error: ${err.message}. Data will retry automatically.`);
+                } finally {
+                setLoading(false);
+                setRefreshing(false);
+                }
+            };
+
+            const processVIVData = (observations, forecasts) => {
+                const timeline = {};
+                const now = new Date();
+                const past48h = new Date(now.getTime() - 48 * 60 * 60 * 1000);
+                const future48h = new Date(now.getTime() + 48 * 60 * 60 * 1000);
+
+                // 1. Process Observations
+                observations.forEach(ob => {
+                const date = new Date(ob.properties.timestamp);
+                if (date >= past48h && date <= now && ob.properties.temperature.value !== null) {
+                    const tempF = Math.round((ob.properties.temperature.value * 9/5) + 32);
+                    const hourKey = new Date(date.getFullYear(), date.getMonth(), date.getDate(), date.getHours()).toISOString();
+                    
+                    if (!timeline[hourKey] || date > timeline[hourKey].actualDate) {
+                    const isNight = date.getHours() >= 20 || date.getHours() <= 8; // 8 PM to 8 AM Local
+                    timeline[hourKey] = { ...timeline[hourKey], time: new Date(hourKey), obs: tempF, actualDate: date, isNight };
+                    }
+                }
+                });
+
+                // 2. Process Forecasts
+                forecasts.forEach(fcst => {
+                const date = new Date(fcst.startTime);
+                if (date >= past48h && date <= future48h) {
+                    const hourKey = new Date(date.getFullYear(), date.getMonth(), date.getDate(), date.getHours()).toISOString();
+                    const isNight = date.getHours() >= 20 || date.getHours() <= 8;
+                    timeline[hourKey] = { ...timeline[hourKey], time: date, fcst: fcst.temperature, isNight };
+                }
+                });
+
+                // 3. Compile, Sort, Calculate Errors, and Find Highs/Lows
+                let sortedData = Object.values(timeline)
+                .sort((a, b) => a.time - b.time)
+                .map(entry => {
+                    let err = null;
+                    if (entry.obs !== undefined && entry.fcst !== undefined) {
+                    err = entry.fcst - entry.obs; // Model Error
+                    }
+                    return { ...entry, error: err, timestampMs: entry.time.getTime() };
+                });
+
+                // Calculate Daily Highs and Lows (Grouped by Central Time Day)
+                const dailyExtremes = {};
+                sortedData.forEach(d => {
+                // Safely generate a date key without re-parsing localized strings
+                const dateKey = d.time.toLocaleDateString('en-US', { timeZone: 'America/Chicago' });
+                
+                const temp = d.obs !== undefined ? d.obs : d.fcst;
+                if (temp === undefined) return;
+
+                if (!dailyExtremes[dateKey]) {
+                    dailyExtremes[dateKey] = { high: { temp: -999, ms: null }, low: { temp: 999, ms: null } };
+                }
+                
+                if (temp > dailyExtremes[dateKey].high.temp) {
+                    dailyExtremes[dateKey].high = { temp, ms: d.timestampMs };
+                }
+                if (temp < dailyExtremes[dateKey].low.temp) {
+                    dailyExtremes[dateKey].low = { temp, ms: d.timestampMs };
+                }
+                });
+
+                // Tag the extreme data points
+                const extremeMsSet = new Set();
+                Object.values(dailyExtremes).forEach(ext => {
+                if (ext.high.ms) extremeMsSet.add(`H-${ext.high.ms}`);
+                if (ext.low.ms) extremeMsSet.add(`L-${ext.low.ms}`);
+                });
+
+                sortedData = sortedData.map(d => ({
+                ...d,
+                isHigh: extremeMsSet.has(`H-${d.timestampMs}`),
+                isLow: extremeMsSet.has(`L-${d.timestampMs}`)
+                }));
+
+                // Find ideal default zoom range (24h past to 24h future) to space out labels
+                if (sortedData.length > 0) {
+                const nowTime = new Date().getTime();
+                const start24 = nowTime - (24 * 60 * 60 * 1000);
+                const end24 = nowTime + (24 * 60 * 60 * 1000);
+                let sIdx = sortedData.findIndex(d => d.timestampMs >= start24);
+                let eIdx = sortedData.findIndex(d => d.timestampMs >= end24);
+                
+                if (sIdx === -1) sIdx = 0;
+                if (eIdx === -1 || eIdx === 0) eIdx = sortedData.length - 1;
+                
+                // Ensure the Brush end index is strictly greater than the start index
+                if (sIdx >= eIdx) {
+                    sIdx = 0;
+                    eIdx = sortedData.length - 1;
+                }
+                
+                setBrushRange({ startIndex: sIdx, endIndex: eIdx });
+                } else {
+                setBrushRange(null);
+                }
+                
+                setData(sortedData);
+                calculateMetrics(sortedData);
+                extractLows(sortedData);
+            };
+
+            const calculateMetrics = (chartData) => {
+                let sumAbsoluteError = 0;
+                let sumBias = 0;
+                let nightBiasSum = 0;
+                let count = 0;
+                let nightCount = 0;
+
+                const overlapping = chartData.filter(d => d.obs !== undefined && d.fcst !== undefined);
+                
+                if (overlapping.length > 0) {
+                const current = overlapping[overlapping.length - 1];
+                
+                overlapping.forEach(d => {
+                    sumAbsoluteError += Math.abs(d.error);
+                    sumBias += d.error;
+                    count++;
+                    
+                    if (d.isNight) {
+                    nightBiasSum += d.error;
+                    nightCount++;
+                    }
+                });
+
+                setMetrics({
+                    currentObs: current.obs,
+                    currentFcst: current.fcst,
+                    currentError: current.fcst - current.obs,
+                    overallBias: count > 0 ? (sumBias / count).toFixed(1) : null,
+                    nightBias: nightCount > 0 ? (nightBiasSum / nightCount).toFixed(1) : null,
+                    mae: count > 0 ? (sumAbsoluteError / count).toFixed(1) : null,
+                });
+                }
+            };
+
+            const extractLows = (chartData) => {
+                const now = new Date();
+                
+                // Tonight window: 18:00 today to 10:00 tomorrow
+                const tonightStart = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 18, 0, 0);
+                const tonightEnd = new Date(now.getFullYear(), now.getMonth(), now.getDate() + 1, 10, 0, 0);
+                
+                // Tomorrow night window: 18:00 tomorrow to 10:00 day after
+                const tmrwNightStart = new Date(now.getFullYear(), now.getMonth(), now.getDate() + 1, 18, 0, 0);
+                const tmrwNightEnd = new Date(now.getFullYear(), now.getMonth(), now.getDate() + 2, 10, 0, 0);
+
+                const getMinInWindow = (start, end) => {
+                const windowData = chartData.filter(d => d.time >= start && d.time <= end && d.fcst !== undefined);
+                if (windowData.length === 0) return null;
+                return windowData.reduce((min, p) => p.fcst < min ? p.fcst : min, windowData[0].fcst);
+                };
+
+                setLowTemps({
+                tonight: getMinInWindow(tonightStart, tonightEnd),
+                tomorrowNight: getMinInWindow(tmrwNightStart, tmrwNightEnd)
+                });
+            };
+
+            useEffect(() => {
+                fetchData();
+                const interval = setInterval(fetchData, 15 * 60 * 1000);
+                return () => clearInterval(interval);
+            }, []);
+
+            const formatZ = (date) => {
+                if (!date || isNaN(date.getTime())) return '';
+                return date.toLocaleTimeString('en-US', { timeZone: 'UTC', hour: '2-digit', minute: '2-digit', hour12: false }) + 'Z';
+            };
+            
+            const formatCT = (date) => {
+                if (!date || isNaN(date.getTime())) return '';
+                return date.toLocaleTimeString('en-US', { timeZone: 'America/Chicago', hour: '2-digit', minute: '2-digit', hour12: true });
+            };
+            
+            const formatShortTime = (date) => {
+                if (!date || isNaN(date.getTime())) return '';
+                const time = date.toLocaleTimeString('en-US', { timeZone: 'America/Chicago', hour: 'numeric', hour12: true });
+                const day = date.toLocaleDateString('en-US', { timeZone: 'America/Chicago', weekday: 'short' });
+                return date.getHours() === 0 ? `${day}` : time; 
+            };
+
+            const CustomTooltip = ({ active, payload, label }) => {
+                if (active && payload && payload.length) {
+                const date = new Date(label);
+                return (
+                    <div className="bg-white p-4 rounded-lg shadow-xl border border-slate-200 text-slate-800 text-sm z-50">
+                    <p className="font-bold text-blue-700 mb-2 border-b border-slate-200 pb-1">
+                        {formatZ(date)} | {formatCT(date)}
+                    </p>
+                    {payload.map((entry, index) => (
+                        <p key={index} style={{ color: entry.color }} className="my-1 flex justify-between gap-4">
+                        <span>{entry.name}:</span>
+                        <span className="font-bold">{entry.value}°F</span>
+                        </p>
+                    ))}
+                    {payload.length === 2 && payload[0].value !== undefined && payload[1].value !== undefined && (
+                        <p className="mt-2 pt-2 border-t border-slate-200 flex justify-between gap-4 text-slate-600">
+                        <span>Model Error:</span>
+                        <span className="font-bold">
+                            {(payload[1].value - payload[0].value) > 0 ? '+' : ''}{(payload[1].value - payload[0].value)}°F
+                        </span>
+                        </p>
+                    )}
+                    </div>
+                );
+                }
+                return null;
+            };
+
+            const getAdjustedLow = (forecastLow) => {
+                if (forecastLow === null || metrics.nightBias === null) return '--';
+                const numBias = parseFloat(metrics.nightBias);
+                const adjusted = Math.round(forecastLow - numBias);
+                return `${adjusted}°`;
+            };
+
+            const CustomLabel = (props) => {
+                const { x, y, value, payload, dataKey, index } = props;
+                
+                if (value === null || value === undefined || !payload) return null;
+                if (Number.isNaN(x) || Number.isNaN(y)) return null;
+
+                let isExtreme = false;
+                let extremeText = "";
+                
+                if (dataKey === 'obs') {
+                if (payload.isHigh && payload.obs === value) { isExtreme = true; extremeText = "HIGH"; }
+                if (payload.isLow && payload.obs === value) { isExtreme = true; extremeText = "LOW"; }
+                } else if (dataKey === 'fcst' && payload.obs === undefined) {
+                if (payload.isHigh && payload.fcst === value) { isExtreme = true; extremeText = "HIGH"; }
+                if (payload.isLow && payload.fcst === value) { isExtreme = true; extremeText = "LOW"; }
+                }
+
+                const fillColor = dataKey === 'obs' ? '#f59e0b' : '#60a5fa';
+                const hasBoth = payload.obs !== undefined && payload.fcst !== undefined;
+                
+                let dyOffset = 0; 
+                
+                if (isExtreme) {
+                dyOffset = extremeText === "HIGH" ? -25 : 25;
+                } else if (hasBoth) {
+                if (payload.obs === payload.fcst) {
+                    dyOffset = dataKey === 'obs' ? -15 : 20; 
+                } else if (dataKey === 'obs') {
+                    dyOffset = payload.obs > payload.fcst ? -15 : 20;
+                } else if (dataKey === 'fcst') {
+                    dyOffset = payload.fcst > payload.obs ? -15 : 20;
+                }
+                } else {
+                dyOffset = index % 2 === 0 ? -12 : 20;
+                }
+
+                const textStyle = {
+                fill: fillColor,
+                fontSize: isExtreme ? 13 : 10,
+                fontWeight: isExtreme ? "bold" : "normal",
+                textAnchor: "middle",
+                stroke: "#ffffff",
+                strokeWidth: 3,
+                paintOrder: "stroke fill" 
+                };
+
+                return (
+                <g>
+                    {isExtreme && (
+                    <text x={x} y={y} dy={extremeText === "HIGH" ? -40 : 45} style={textStyle} fill={fillColor} fontSize={11} fontWeight="bold" textAnchor="middle">
+                        {extremeText}
+                    </text>
+                    )}
+                    <text x={x} y={y} dy={dyOffset} style={textStyle}>
+                    {value}°
+                    </text>
+                </g>
+                );
+            };
+
+            if (loading) {
+                return (
+                <div className="min-h-screen bg-slate-50 p-4 md:p-8 flex flex-col space-y-6">
+                    <div className="max-w-7xl mx-auto w-full space-y-6 animate-pulse">
+                    <div className="h-24 bg-slate-200 rounded-2xl w-full"></div>
+                    <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+                        <div className="h-96 bg-slate-200 rounded-2xl col-span-1"></div>
+                        <div className="h-96 bg-slate-200 rounded-2xl col-span-1 lg:col-span-2"></div>
+                    </div>
+                    <div className="h-[500px] bg-slate-200 rounded-2xl w-full"></div>
+                    </div>
+                </div>
+                );
+            }
+
+            return (
+                <div className="min-h-screen bg-slate-50 text-slate-900 p-4 md:p-8 font-sans">
+                <div className="max-w-7xl mx-auto space-y-6">
+                    
+                    {/* Header */}
+                    <div className="flex flex-col md:flex-row justify-between items-start md:items-center bg-white p-6 rounded-2xl shadow-sm border border-slate-200">
+                    <div>
+                        <h1 className="text-2xl font-bold flex items-center gap-2 text-slate-900">
+                        <Activity className="text-blue-600" />
+                        KDFW Forecaster Dashboard
+                        </h1>
+                        <p className="text-slate-500 text-sm mt-1">
+                        VIV Analysis & Tmin Decision Support
+                        </p>
+                    </div>
+                    <div className="mt-4 md:mt-0 flex items-center gap-4">
+                        <div className="text-right">
+                        <p className="text-xs text-slate-500">Auto-updates 15m</p>
+                        <p className="text-sm font-medium flex items-center gap-1 text-slate-700">
+                            <Clock size={14}/> 
+                            {lastUpdated ? `${formatCT(lastUpdated)} (${formatZ(lastUpdated)})` : 'Updating...'}
+                        </p>
+                        </div>
+                        <button 
+                        onClick={fetchData} 
+                        disabled={refreshing}
+                        className="p-3 bg-blue-50 text-blue-600 border border-blue-200 hover:bg-blue-100 rounded-xl transition-colors disabled:opacity-50 flex items-center justify-center"
+                        >
+                        <RefreshCw size={20} className={refreshing ? "animate-spin" : ""} />
+                        </button>
+                    </div>
+                    </div>
+
+                    {error && (
+                    <div className="bg-red-50 border border-red-200 text-red-700 p-4 rounded-xl flex items-center gap-3">
+                        <AlertCircle />
+                        <p><strong>Warning:</strong> {error}</p>
+                    </div>
+                    )}
+
+                    <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+                    
+                    {/* Current State Column */}
+                    <div className="col-span-1 space-y-4">
+                        <h2 className="text-sm font-bold text-slate-500 uppercase tracking-wider">Current Nowcast (VIV)</h2>
+                        <div className="grid grid-cols-2 gap-4">
+                        <div className="bg-white p-4 rounded-xl border border-slate-200 shadow-sm">
+                            <p className="text-slate-500 text-xs mb-1">METAR (Obs)</p>
+                            <div className="text-3xl font-bold text-amber-600">{metrics.currentObs ?? '--'}°</div>
+                        </div>
+                        <div className="bg-white p-4 rounded-xl border border-slate-200 shadow-sm">
+                            <p className="text-slate-500 text-xs mb-1">NWS Grid</p>
+                            <div className="text-3xl font-bold text-blue-600">{metrics.currentFcst ?? '--'}°</div>
+                        </div>
+                        </div>
+                        
+                        <div className="bg-white p-4 rounded-xl border border-slate-200 shadow-sm flex justify-between items-center">
+                        <div>
+                            <p className="text-slate-500 text-xs mb-1">Current Error (Bias)</p>
+                            <p className="text-xs text-slate-400">Grid minus Obs</p>
+                        </div>
+                        <div className={`text-3xl font-bold ${metrics.currentError > 0 ? 'text-red-500' : metrics.currentError < 0 ? 'text-blue-500' : 'text-green-500'}`}>
+                            {metrics.currentError !== null ? (metrics.currentError > 0 ? `+${metrics.currentError}` : metrics.currentError) : '--'}°
+                        </div>
+                        </div>
+
+                        <div className="bg-white p-4 rounded-xl border border-slate-200 shadow-sm space-y-3">
+                        <div className="flex justify-between items-center border-b border-slate-100 pb-2">
+                            <span className="text-slate-600 text-sm">Overall Avg Bias</span>
+                            <span className={`font-bold ${metrics.overallBias > 0 ? 'text-red-500' : 'text-blue-600'}`}>
+                            {metrics.overallBias > 0 ? '+' : ''}{metrics.overallBias}°
+                            </span>
+                        </div>
+                        <div className="flex justify-between items-center border-b border-slate-100 pb-2" title="Bias looking only at hours between 8PM and 8AM">
+                            <span className="text-slate-600 text-sm flex items-center gap-1"><Moon size={14}/> Nighttime Bias</span>
+                            <span className={`font-bold ${metrics.nightBias > 0 ? 'text-red-500' : 'text-blue-600'}`}>
+                            {metrics.nightBias > 0 ? '+' : ''}{metrics.nightBias}°
+                            </span>
+                        </div>
+                        <div className="flex justify-between items-center">
+                            <span className="text-slate-600 text-sm">Mean Abs Error (MAE)</span>
+                            <span className="font-bold text-slate-800">{metrics.mae}°</span>
+                        </div>
+                        </div>
+                    </div>
+
+                    {/* Decision Support Column */}
+                    <div className="col-span-1 lg:col-span-2 space-y-4">
+                        <h2 className="text-sm font-bold text-slate-500 uppercase tracking-wider">Tmin Decision Support</h2>
+                        <div className="grid grid-cols-1 md:grid-cols-2 gap-4 h-full">
+                        
+                        {/* Tonight's Low */}
+                        <div className="bg-white p-5 rounded-xl border border-slate-200 shadow-sm flex flex-col justify-between">
+                            <div>
+                            <div className="flex items-center gap-2 mb-4">
+                                <Moon className="text-indigo-600" />
+                                <h3 className="text-lg font-bold text-slate-900">Tonight's Forecast Low</h3>
+                            </div>
+                            <div className="flex justify-between items-end mb-4">
+                                <div>
+                                <p className="text-slate-500 text-xs">Raw NWS Grid</p>
+                                <p className="text-4xl font-bold text-indigo-400">{lowTemps.tonight ?? '--'}°</p>
+                                </div>
+                                <div className="text-right">
+                                <p className="text-slate-500 text-xs text-amber-600 mb-1">Apply Night Bias ({metrics.nightBias > 0 ? '+' : ''}{metrics.nightBias}°)</p>
+                                <p className="text-sm text-slate-600">Adjusted Target</p>
+                                <p className="text-3xl font-bold text-amber-600 border-b-2 border-amber-200 inline-block">{getAdjustedLow(lowTemps.tonight)}</p>
+                                </div>
+                            </div>
+                            </div>
+                            <p className="text-xs text-slate-500 italic mt-2">
+                            If the model continues to run {metrics.nightBias > 0 ? 'too warm' : 'too cool'} at night as it has over the last 48 hours, adjust your forecast toward {getAdjustedLow(lowTemps.tonight)}.
+                            </p>
+                        </div>
+
+                        {/* Tomorrow Night's Low */}
+                        <div className="bg-white p-5 rounded-xl border border-slate-200 shadow-sm flex flex-col justify-between opacity-90">
+                            <div>
+                            <div className="flex items-center gap-2 mb-4">
+                                <Moon className="text-indigo-600 opacity-70" />
+                                <h3 className="text-lg font-bold text-slate-700">Tomorrow Night's Low</h3>
+                            </div>
+                            <div className="flex justify-between items-end mb-4">
+                                <div>
+                                <p className="text-slate-500 text-xs">Raw NWS Grid</p>
+                                <p className="text-4xl font-bold text-indigo-300">{lowTemps.tomorrowNight ?? '--'}°</p>
+                                </div>
+                                <div className="text-right">
+                                <p className="text-slate-500 text-xs text-amber-600/70 mb-1">Apply Night Bias</p>
+                                <p className="text-sm text-slate-500">Adjusted Target</p>
+                                <p className="text-3xl font-bold text-amber-500 border-b-2 border-amber-100 inline-block">{getAdjustedLow(lowTemps.tomorrowNight)}</p>
+                                </div>
+                            </div>
+                            </div>
+                            <p className="text-xs text-slate-400 italic mt-2">
+                            Preliminary target for the 24-48hr package, assuming similar boundary layer conditions.
+                            </p>
+                        </div>
+
+                        </div>
+                    </div>
+                    </div>
+
+                    {/* Expanded 96-Hour Chart Panel */}
+                    <div className="bg-white p-6 rounded-2xl shadow-sm border border-slate-200">
+                    <div className="flex justify-between items-end mb-6">
+                        <h2 className="text-lg font-bold text-slate-900">4-Day Temperature Meteogram (48h Past & 48h Future)</h2>
+                        <div className="flex gap-4 text-xs font-medium text-slate-600">
+                        <span className="flex items-center gap-1"><div className="w-3 h-3 bg-amber-500 rounded-full"></div> Obs</span>
+                        <span className="flex items-center gap-1"><div className="w-3 h-0 border-t-2 border-dashed border-blue-500"></div> Forecast</span>
+                        </div>
+                    </div>
+                    <div className="h-[500px] w-full">
+                        <ResponsiveContainer width="100%" height="100%">
+                        <LineChart data={data} margin={{ top: 30, right: 20, left: -20, bottom: 40 }}>
+                            <CartesianGrid strokeDasharray="3 3" stroke="#e2e8f0" vertical={true} horizontal={false} />
+                            <XAxis 
+                            dataKey="timestampMs" 
+                            type="number"
+                            domain={['dataMin', 'dataMax']}
+                            tickFormatter={(unixTime) => formatShortTime(new Date(unixTime))}
+                            stroke="#64748b" 
+                            tick={{ fill: '#64748b', fontSize: 10 }}
+                            dy={10}
+                            interval={0}
+                            angle={-90}
+                            textAnchor="end"
+                            height={85}
+                            />
+                            <YAxis 
+                            domain={['auto', 'auto']} 
+                            stroke="#64748b" 
+                            tick={{ fill: '#64748b' }} 
+                            tickFormatter={(val) => `${val}°`}
+                            />
+                            <Tooltip content={<CustomTooltip />} />
+                            
+                            <ReferenceLine x={new Date().getTime()} stroke="#ef4444" strokeWidth={2} label={{ position: 'insideTopLeft', value: 'NOW', fill: '#ef4444', fontSize: 12, fontWeight: 'bold' }} />
+
+                            <Line 
+                            type="monotone" 
+                            dataKey="obs" 
+                            name="Actual (Obs)" 
+                            stroke="#f59e0b" 
+                            strokeWidth={3}
+                            dot={{ r: 4, fill: '#f59e0b', stroke: '#ffffff', strokeWidth: 2 }}
+                            activeDot={{ r: 6 }}
+                            connectNulls
+                            label={<CustomLabel />}
+                            />
+                            
+                            <Line 
+                            type="monotone" 
+                            dataKey="fcst" 
+                            name="NWS Forecast" 
+                            stroke="#3b82f6" 
+                            strokeWidth={3}
+                            strokeDasharray="5 5"
+                            dot={{ r: 4, fill: '#ffffff', stroke: '#3b82f6', strokeWidth: 2 }}
+                            activeDot={{ r: 6 }}
+                            connectNulls
+                            label={<CustomLabel />}
+                            />
+                            
+                            {brushRange && brushRange.startIndex < brushRange.endIndex && (
+                            <Brush 
+                                dataKey="timestampMs" 
+                                height={30} 
+                                stroke="#cbd5e1" 
+                                fill="#f1f5f9" 
+                                tickFormatter={() => ''} 
+                                startIndex={brushRange.startIndex}
+                                endIndex={brushRange.endIndex}
+                            />
+                            )}
+                        </LineChart>
+                        </ResponsiveContainer>
+                    </div>
+                    </div>
+
+                </div>
+                </div>
+            );
+        };
+
+        const root = ReactDOM.createRoot(document.getElementById('root'));
+        root.render(<App />);
+    </script>
+</body>
+</html>
